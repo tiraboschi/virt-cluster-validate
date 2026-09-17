@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-import io, os, sys, json, argparse, tempfile, time, threading, subprocess, signal, random, shutil
+import io, os, sys, json, argparse, tempfile, time, threading, subprocess, signal, random, shutil, base64
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -387,11 +387,15 @@ def print_details(results, verbose, skip_log_print=False):
                 print("    --- Test Output ---")
                 for line in r["log"]: print(f"    {line}")
 
-def write_provider_kubeconfig(path, url, token, insecure_skip_tls=False):
+def write_provider_kubeconfig(path, url, token, insecure_skip_tls=False, ca_file=None):
     """Write a kubeconfig that authenticates with a bearer token (kubectl-mtv provider style)."""
     cluster = {"server": url}
     if insecure_skip_tls:
         cluster["insecure-skip-tls-verify"] = True
+    elif ca_file:
+        cluster["certificate-authority-data"] = base64.b64encode(
+            Path(ca_file).read_bytes()
+        ).decode("ascii")
     kubeconfig = {
         "apiVersion": "v1",
         "kind": "Config",
@@ -405,15 +409,25 @@ def write_provider_kubeconfig(path, url, token, insecure_skip_tls=False):
 
 
 def resolve_provider_auth(args):
-    """Return (url, token) from flags or env. Both must be set together."""
+    """Return (url, token, ca_file) from flags or env."""
     url = args.url or os.environ.get("VIRT_VALIDATE_URL") or ""
     token = args.token or os.environ.get("VIRT_VALIDATE_TOKEN") or ""
+    ca_file = args.ca_file or os.environ.get("VIRT_VALIDATE_CA_FILE") or ""
     if bool(url) != bool(token):
         raise argparse.ArgumentTypeError(
             "--url and --token must be provided together "
             "(or set both VIRT_VALIDATE_URL and VIRT_VALIDATE_TOKEN)."
         )
-    return url, token
+    if ca_file and not url:
+        raise argparse.ArgumentTypeError(
+            "--ca-file requires --url (or set VIRT_VALIDATE_URL)."
+        )
+    if ca_file:
+        try:
+            Path(ca_file).read_bytes()
+        except OSError as exc:
+            raise argparse.ArgumentTypeError(f"Could not read CA file {ca_file}: {exc}") from exc
+    return url, token, ca_file
 
 
 def main():
@@ -430,23 +444,24 @@ def main():
     parser.add_argument("-c", "--concurrency", type=int, default=os.cpu_count() or 4, metavar="N", help="Number of concurrent tests to run (default: CPU count)")
     parser.add_argument("--url", metavar="URL", help="OpenShift API server URL (requires --token)")
     parser.add_argument("--token", metavar="TOKEN", help="Bearer token for --url (service account or user token)")
+    parser.add_argument("--ca-file", metavar="PATH", help="CA certificate file for --url (or VIRT_VALIDATE_CA_FILE)")
     parser.add_argument("--insecure-skip-tls", action="store_true", help="Skip TLS verification for --url (self-signed API certs)")
     args = parser.parse_args()
 
     try:
-        provider_url, token = resolve_provider_auth(args)
+        provider_url, token, ca_file = resolve_provider_auth(args)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
 
     # 1. Environment & Discovery
     cache_dir = tempfile.mkdtemp(prefix="virt_validate_cache_")
     try:
-        _run_with_cache(args, cache_dir, provider_url, token)
+        _run_with_cache(args, cache_dir, provider_url, token, ca_file)
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
 
-def _run_with_cache(args, cache_dir, provider_url, token):
+def _run_with_cache(args, cache_dir, provider_url, token, ca_file):
     env = {**os.environ,
            "PATH": f"{os.path.abspath('bin')}{os.pathsep}{os.environ.get('PATH', '')}",
            "VIRT_VALIDATE_CACHE_DIR": cache_dir}
@@ -455,7 +470,7 @@ def _run_with_cache(args, cache_dir, provider_url, token):
     if provider_url:
         kubeconfig_path = Path(cache_dir) / "kubeconfig"
         insecure = args.insecure_skip_tls or os.environ.get("VIRT_VALIDATE_INSECURE_SKIP_TLS", "").lower() in ("1", "true", "yes")
-        write_provider_kubeconfig(kubeconfig_path, provider_url, token, insecure)
+        write_provider_kubeconfig(kubeconfig_path, provider_url, token, insecure, ca_file)
         env["KUBECONFIG"] = str(kubeconfig_path)
 
     is_mock = os.environ.get("VIRT_VALIDATE_MOCK") == "1"

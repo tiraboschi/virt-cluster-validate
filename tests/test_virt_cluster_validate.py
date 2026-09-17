@@ -490,6 +490,30 @@ class TestVirtClusterValidate(unittest.TestCase):
         output = json.loads(res.stdout)
         self.assertEqual(output["results"]["summary"]["passed"], 1)
 
+    def test_ca_file_writes_kubeconfig_ca_data(self):
+        """Test that --ca-file embeds the CA certificate in the generated kubeconfig."""
+        self._create_prerequisite("#!/bin/bash\nexit 0")
+        ca_file = self.workspace / "ca.crt"
+        ca_file.write_text("test CA certificate\n")
+        self._create_test(
+            "10-kubeconfig.d",
+            "#!/bin/bash\n"
+            "python3 -c \"import base64,json,os; c=json.load(open(os.environ['KUBECONFIG'])); "
+            "assert base64.b64decode(c['clusters'][0]['cluster']['certificate-authority-data']) == b'test CA certificate\\\\n'; "
+            "assert 'insecure-skip-tls-verify' not in c['clusters'][0]['cluster']\"\n"
+        )
+
+        res = subprocess.run(
+            [
+                sys.executable, str(RUNNER_SCRIPT), "-o", "ctrf",
+                "--url", "https://api.cluster.example.com:6443",
+                "--token", "test-token", "--ca-file", str(ca_file),
+            ], cwd=self.workspace, capture_output=True, text=True,
+        )
+
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        self.assertEqual(json.loads(res.stdout)["results"]["summary"]["passed"], 1)
+
     def test_url_without_token_errors(self):
         """Test that --url without --token is rejected."""
         self._create_test("10-pass.d", "#!/bin/bash\nexit 0")

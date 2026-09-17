@@ -24,7 +24,7 @@ Validates an OpenShift cluster's virtualization readiness.
 
     # Or authenticate with API URL + bearer token (no prior oc login)
     ./virt-cluster-validate --url https://api.cluster.example.com:6443 \
-      --token "$TOKEN" --insecure-skip-tls
+      --token "$TOKEN" --ca-file /path/to/ca.crt
 
     # Basic run (Human readable, summary only)
     ./virt-cluster-validate
@@ -63,9 +63,10 @@ Validates an OpenShift cluster's virtualization readiness.
 *   `-f [N], --fail-fast [N]`: Stop execution after N failures (Default: 1).
 *   `--url URL`: OpenShift API server URL. Must be used with `--token`.
 *   `--token TOKEN`: Bearer token for `--url` (service account or user token).
+*   `--ca-file PATH`: CA certificate file used to verify `--url` (use instead of `--insecure-skip-tls`).
 *   `--insecure-skip-tls`: Skip TLS verification when using `--url` (typical for self-signed API certs).
 
-`--url` and `--token` can also be set via `VIRT_VALIDATE_URL` and `VIRT_VALIDATE_TOKEN`. Set `VIRT_VALIDATE_INSECURE_SKIP_TLS=true` to skip TLS verification.
+`--url`, `--token`, and `--ca-file` can also be set via `VIRT_VALIDATE_URL`, `VIRT_VALIDATE_TOKEN`, and `VIRT_VALIDATE_CA_FILE`. Set `VIRT_VALIDATE_INSECURE_SKIP_TLS=true` to skip TLS verification.
 
 ## Disconnected Environments (Container)
 
@@ -114,6 +115,7 @@ The container image includes a must-gather entry point, allowing you to run the 
 *   `TIMEOUT`: Per-check timeout (e.g. `5m`, `300`. Default: `180`).
 *   `CONCURRENCY`: Number of parallel checks (Default: CPU count).
 *   `VIRT_VALIDATE_URL` / `VIRT_VALIDATE_TOKEN`: Remote cluster API URL and bearer token (same as `--url` / `--token`).
+*   `VIRT_VALIDATE_CA_FILE`: CA certificate file for verifying the remote API (same as `--ca-file`).
 *   `VIRT_VALIDATE_INSECURE_SKIP_TLS`: Set to `true` to skip TLS verification for the remote API.
 
 ### Output
