@@ -1,0 +1,213 @@
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: virt-validation-controller
+  namespace: openshift-mtv
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: virt-validation-controller-metrics
+  namespace: openshift-mtv
+  labels:
+    # These labels identify the metrics Service. They are intentionally
+    # distinct from the controller Pod label used by spec.selector below.
+    app.kubernetes.io/name: virt-validation-controller-metrics
+    app.kubernetes.io/component: metrics
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: virt-validation-controller-metrics-tls
+spec:
+  selector:
+    app.kubernetes.io/name: virt-validation-controller
+  ports:
+    - name: https
+      port: 8443
+      targetPort: metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: virt-validation-controller
+subjects:
+  - kind: ServiceAccount
+    name: virt-validation-controller
+    namespace: openshift-mtv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: virt-validation-controller
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: virt-validation-controller
+  namespace: openshift-mtv
+  labels:
+    app.kubernetes.io/name: virt-validation-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller-metrics
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: https
+      path: /metrics
+      scheme: https
+      tlsConfig:
+        ca: {}
+        cert: {}
+        insecureSkipVerify: false
+        serverName: virt-validation-controller-metrics.openshift-mtv.svc
+  scrapeClass: tls-client-certificate-auth
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: virt-validation-controller
+  namespace: openshift-mtv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: virt-validation-controller
+    spec:
+      serviceAccountName: virt-validation-controller
+      containers:
+        - name: manager
+          image: quay.io/openshift-cnv/virt-validation-controller@sha256:replace-me
+          args:
+            - --validator-image=quay.io/openshift-cnv/virt-cluster-validate@sha256:replace-me
+            - --leader-elect=true
+            - --leader-election-namespace=openshift-mtv
+          ports:
+            - containerPort: 8443
+              name: metrics
+            - containerPort: 8081
+              name: healthz
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: metrics-serving-cert
+              mountPath: /etc/tls/private
+              readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: metrics-serving-cert
+          secret:
+            secretName: virt-validation-controller-metrics-tls
+---
+# The controller runs in the shared openshift-mtv namespace. These policies
+# select only its Pods; validator Jobs run in the VirtualizationValidation
+# namespace and receive a separate, per-run policy there.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: virt-validation-default-deny
+  namespace: openshift-mtv
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller
+  policyTypes: [Ingress, Egress]
+---
+# Kubernetes API access is needed for controller reconciliation, leader
+# election, and metrics client-CA rotation. Kubernetes Services are DNATed to
+# node endpoints on OpenShift, so a portable NetworkPolicy cannot safely
+# distinguish the API server from another HTTPS destination by pod selector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: virt-validation-allow-api-server
+  namespace: openshift-mtv
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+# Target API names and tool-download Routes require DNS resolution.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: virt-validation-allow-dns
+  namespace: openshift-mtv
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# mTLS enforces the Prometheus identity; limit the network path to the
+# platform-monitoring namespace as an additional boundary.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: virt-validation-allow-metrics
+  namespace: openshift-mtv
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: virt-validation-controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+      ports:
+        - protocol: TCP
+          port: 8443

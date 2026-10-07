@@ -1,0 +1,55 @@
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: target-cluster-credentials
+  namespace: openshift-mtv
+type: Opaque
+stringData:
+  token: replace-me
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    replace-me
+    -----END CERTIFICATE-----
+---
+apiVersion: validation.kubevirt.io/v1alpha1
+kind: VirtualizationValidation
+metadata:
+  name: target-canary
+  namespace: openshift-mtv
+spec:
+  target:
+    url: https://api.target.example.com:6443
+    credentialsSecret:
+      name: target-cluster-credentials
+      tokenKey: token
+      caKey: ca.crt
+    identity:
+      id: target-cluster-uuid
+      displayName: target-cnv
+  workload:
+    namespace: mtv-validation
+    dataSource:
+      apiGroup: cdi.kubevirt.io
+      kind: DataSource
+      namespace: openshift-virtualization-os-images
+      name: rhel10
+  run:
+    id: initial
+    profile: basic-v1
+    suiteTimeoutSeconds: 900
+    executionTimeoutSeconds: 300
+    queueTimeoutSeconds: 900

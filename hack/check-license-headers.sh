@@ -40,9 +40,11 @@ done
 enddate=$(date +%Y)
 
 # Get all tracked source files that should have copyright headers
-# Exclude: binary files (images, archives), data files (json), LICENSE, gitignore files, documentation files (README.md, CONTRIBUTING.md), OWNERS files
+# Exclude: vendored third-party code, generated CRDs, binary files (images,
+# archives), data files (json), Go module metadata, license files, gitignore
+# files, documentation, and OWNERS files.
 get_source_files() {
-    git ls-files | grep -v -E '\.(png|jpg|jpeg|gif|svg|ico|pdf|tar|gz|zip|json|jsonl|lock)$' | grep -v -E '^(LICENSE|\.gitignore|\.dockerignore|README\.md|CONTRIBUTING\.md|OWNERS|OWNERS_ALIASES)$' || true
+    git ls-files | grep -v -E '^(vendor/|config/crd/bases/|config/rbac/role\.yaml$|go\.mod$|LICENSE$|\.gitignore$|\.dockerignore$|OWNERS$|OWNERS_ALIASES$)' | grep -v -E '\.(png|jpg|jpeg|gif|svg|ico|pdf|tar|gz|zip|json|jsonl|lock|sum|md)$' || true
 }
 
 # Update copyright dates for files that already have headers

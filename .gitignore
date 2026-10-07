@@ -1,6 +1,8 @@
 **.swp
-**generated**
 results.d
+bin/validation-controller
+target-canary-all.yaml
+validation.yaml
 
 # Python compiled files
 __pycache__/
