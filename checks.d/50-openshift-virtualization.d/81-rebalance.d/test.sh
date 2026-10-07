@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
-promql() { oc exec -c prometheus -n openshift-monitoring prometheus-k8s-0 -- curl -s --data-urlencode "query=$*" http://localhost:9090/api/v1/query ; }
+PROMQL_TIMEOUT="${VIRT_VALIDATE_EXECUTION_TIMEOUT_SECONDS:-180}"
+
+promql() { oc exec -c prometheus -n openshift-monitoring prometheus-k8s-0 -- curl --silent --show-error --connect-timeout 10 --max-time "$PROMQL_TIMEOUT" --data-urlencode "query=$*" http://localhost:9090/api/v1/query ; }
 
 echo TBD FIXME

@@ -16,7 +16,7 @@
 #
 
 # Check if we are logged in
-oc whoami > /dev/null 2>&1 || fail_with "Not logged into an OpenShift cluster. Run 'oc login' or pass --url and --token."
+WHOAMI=$(oc whoami 2>&1) || fail_with "Cannot authenticate to the target OpenShift API: ${WHOAMI}"
 
 # Report success with the current user name
-pass_with info login "Logged in as $(oc whoami)"
+pass_with info login "Logged in as ${WHOAMI}"
