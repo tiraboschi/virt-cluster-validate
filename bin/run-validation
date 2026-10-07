@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+report_file="${VIRT_VALIDATE_REPORT_FILE:-/tmp/virt-validation/ctrf.json}"
+mkdir -p "$(dirname "$report_file")"
+/opt/app-root/src/bin/download-tools.sh
+publish-ctrf &
+publisher_pid=$!
+runner_pid=""
+
+shutdown() {
+    trap - TERM INT
+    if [[ -n "$runner_pid" ]]; then
+        # The executor forwards SIGTERM to each check's process group, allowing
+        # the check EXIT traps to remove target-side canary resources.
+        kill -TERM "$runner_pid" 2>/dev/null || true
+        wait "$runner_pid" 2>/dev/null || true
+    fi
+    publish-ctrf --once || true
+    exit 143
+}
+trap shutdown TERM INT
+trap 'kill "$publisher_pid" 2>/dev/null || true' EXIT
+
+set +e
+runner_args=(-o ctrf --report-file "$report_file")
+if [[ -n "${VIRT_VALIDATE_PROFILE:-}" ]]; then
+    runner_args+=(--profile "$VIRT_VALIDATE_PROFILE")
+fi
+if [[ -n "${VIRT_VALIDATE_CONCURRENCY:-}" ]]; then
+    runner_args+=(--concurrency "$VIRT_VALIDATE_CONCURRENCY")
+fi
+if [[ -n "${VIRT_VALIDATE_EXECUTION_TIMEOUT_SECONDS:-}" ]]; then
+    runner_args+=(--timeout "$VIRT_VALIDATE_EXECUTION_TIMEOUT_SECONDS")
+    export VM_READY_TIMEOUT="${VIRT_VALIDATE_EXECUTION_TIMEOUT_SECONDS}s"
+fi
+cd /opt/app-root/src
+/opt/app-root/src/virt-cluster-validate "${runner_args[@]}" &
+runner_pid=$!
+wait "$runner_pid"
+result=$?
+runner_pid=""
+set -e
+publish-ctrf --once
+exit "$result"

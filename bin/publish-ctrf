@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Publish atomic CTRF snapshots to the controller-provided ConfigMap."""
+
+import hashlib
+import copy
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+REPORT = Path(os.environ.get("VIRT_VALIDATE_REPORT_FILE", "/tmp/virt-validation/ctrf.json"))
+TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+CA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+NAME = os.environ["VIRT_VALIDATE_RESULT_CONFIGMAP"]
+NAMESPACE = os.environ.get("VIRT_VALIDATE_RESULT_CONFIGMAP_NAMESPACE", "default")
+API = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ.get('KUBERNETES_SERVICE_PORT_HTTPS', '443')}"
+URL = f"{API}/api/v1/namespaces/{NAMESPACE}/configmaps/{NAME}"
+MAX_REPORT_BYTES = 900_000
+REDUCTION_KEY = "validation.kubevirt.io/reduction"
+MAX_FAILURE_EXEMPLARS = 2
+MAX_FAILURE_DETAILS = 64
+PUBLISH_RETRY_SECONDS = 5
+ADVISORY_TEST_IDS = {"50-openshift-virtualization.d/10-quota.d/test.sh"}
+
+
+def encoded_report(report):
+    return json.dumps(report, separators=(",", ":"))
+
+
+def reduction(report):
+    return report.setdefault("results", {}).setdefault("extra", {}).setdefault(REDUCTION_KEY, {
+        "level": 0,
+        "totalExecutions": report["results"]["summary"]["tests"],
+        "pendingCollapsed": 0,
+        "passedCollapsed": 0,
+        "requiredFailuresOmitted": 0,
+        "advisoryFailuresOmitted": 0,
+        "requiredInconclusiveOmitted": 0,
+        "advisoryInconclusiveOmitted": 0,
+    })
+
+
+def failure_reason(test):
+    return test.get("extra", {}).get("validation.kubevirt.io/reason", "CheckFailed")
+
+
+def unsuccessful(test):
+    return test.get("status") not in ("passed", "pending")
+
+
+def record_omitted_outcome(descriptor, test):
+    advisory = test.get("testId") in ADVISORY_TEST_IDS
+    failure = test.get("extra", {}).get("validation.kubevirt.io/outcome") == "Failed"
+    key = (
+        "advisoryFailuresOmitted" if advisory else "requiredFailuresOmitted"
+    ) if failure else (
+        "advisoryInconclusiveOmitted" if advisory else "requiredInconclusiveOmitted"
+    )
+    descriptor[key] += 1
+
+
+def apply_reduction(report, level):
+    """Apply one monotonic reduction rung and update the report descriptor."""
+    tests = report["results"]["tests"]
+    descriptor = reduction(report)
+    if level == 1:
+        for test in tests:
+            test.pop("trace", None)
+    elif level == 2:
+        pending = [test for test in tests if test.get("status") == "pending"]
+        descriptor["pendingCollapsed"] += len(pending)
+        report["results"]["tests"] = [test for test in tests if test.get("status") != "pending"]
+    elif level == 3:
+        for test in tests:
+            if test.get("status") == "passed":
+                for field in ("parameters", "steps", "duration", "start", "stop"):
+                    test.pop(field, None)
+    elif level == 4:
+        passed = [test for test in tests if test.get("status") == "passed"]
+        descriptor["passedCollapsed"] += len(passed)
+        retained = [test for test in tests if test.get("status") != "passed"]
+        if passed:
+            retained.append({
+                "testId": "validation.kubevirt.io/reduced/passed",
+                "executionId": "summary/passed",
+                "name": f"{len(passed)} passed executions collapsed",
+                "status": "passed",
+                "extra": {"validation.kubevirt.io/synthetic": "true"},
+            })
+        report["results"]["tests"] = retained
+    elif level == 5:
+        retained = []
+        exemplars = {}
+        for test in tests:
+            if not unsuccessful(test):
+                retained.append(test)
+                continue
+            key = (test.get("testId"), failure_reason(test))
+            exemplars[key] = exemplars.get(key, 0) + 1
+            if exemplars[key] <= MAX_FAILURE_EXEMPLARS:
+                retained.append(test)
+            else:
+                record_omitted_outcome(descriptor, test)
+        report["results"]["tests"] = retained
+    elif level == 6:
+        retained = []
+        failures = 0
+        failures_by_severity = sorted(
+            (test for test in tests if unsuccessful(test)),
+            key=lambda test: test.get("testId") in ADVISORY_TEST_IDS,
+        )
+        retained.extend(test for test in tests if not unsuccessful(test))
+        for test in failures_by_severity:
+            if failures < MAX_FAILURE_DETAILS:
+                retained.append(test)
+                failures += 1
+            else:
+                record_omitted_outcome(descriptor, test)
+        report["results"]["tests"] = retained
+    elif level == 7:
+        for test in tests:
+            if unsuccessful(test):
+                record_omitted_outcome(descriptor, test)
+        report["results"]["tests"] = []
+    descriptor["level"] = level
+
+
+def reduce_report(report, budget=MAX_REPORT_BYTES):
+    """Return the minimum sufficient monotonic reduction of a CTRF report."""
+    reduced = copy.deepcopy(report)
+    if len(encoded_report(reduced).encode()) <= budget:
+        return reduced
+    for level in range(1, 8):
+        apply_reduction(reduced, level)
+        if len(encoded_report(reduced).encode()) <= budget:
+            return reduced
+    return reduced
+
+
+def bounded_report(report):
+    """Keep the ConfigMap below budget by applying the minimum sufficient rung."""
+    reduced = reduce_report(json.loads(report))
+    descriptor = reduced.get("results", {}).get("extra", {}).get(REDUCTION_KEY, {})
+    return encoded_report(reduced), descriptor.get("level", 0) > 0
+
+
+def publish():
+    try:
+        report, truncated = bounded_report(REPORT.read_text())
+        request = urllib.request.Request(
+            URL,
+            data=json.dumps({
+                "metadata": {"annotations": {"validation.kubevirt.io/report-truncated": str(truncated).lower()}},
+                "data": {"ctrf.json": report},
+            }).encode(),
+            method="PATCH",
+            headers={
+                "Authorization": f"Bearer {TOKEN.read_text().strip()}",
+                "Content-Type": "application/merge-patch+json",
+            },
+        )
+        with urllib.request.urlopen(request, context=ssl.create_default_context(cafile=CA), timeout=10):
+            pass
+    except (OSError, urllib.error.URLError) as error:
+        print(f"failed to publish CTRF report: {error}", file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    once = "--once" in sys.argv
+    previous = None
+    last_attempt = 0
+    while True:
+        if REPORT.exists():
+            digest = hashlib.sha256(REPORT.read_bytes()).digest()
+            if digest != previous and (once or time.monotonic() - last_attempt >= PUBLISH_RETRY_SECONDS):
+                last_attempt = time.monotonic()
+                if publish():
+                    previous = digest
+        if once:
+            return
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
