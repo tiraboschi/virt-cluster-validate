@@ -20,12 +20,31 @@ set -euo pipefail
 # Redirect all output to both stdout and stderr for debugging
 exec 2>&1
 
-# Download oc and virtctl from the cluster at runtime
-# Cluster domain is inferred from OAuth well-known endpoint (no RBAC required)
-CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-}"
-if [ -z "$CLUSTER_DOMAIN" ]; then
+TOOL_DOWNLOAD_TIMEOUT_SECONDS="${VIRT_VALIDATE_TOOL_DOWNLOAD_TIMEOUT_SECONDS:-300}"
+
+# Download oc and virtctl from the target cluster at runtime. Prefer explicit
+# target endpoints supplied by the validation request. The ingress-domain
+# fallback is retained for conventional OpenShift deployments only.
+OC_URL="${VIRT_VALIDATE_OC_URL:-}"
+VIRTCTL_URL="${VIRT_VALIDATE_VIRTCTL_URL:-}"
+CLUSTER_DOMAIN="${VIRT_VALIDATE_CLUSTER_DOMAIN:-${CLUSTER_DOMAIN:-}}"
+if [ -z "$CLUSTER_DOMAIN" ] && { [ -z "$OC_URL" ] || { [ -z "$VIRTCTL_URL" ] && [ "${VIRT_VALIDATE_SKIP_VIRTCTL:-}" != "true" ]; }; } && [ -n "${VIRT_VALIDATE_URL:-}" ]; then
+    TARGET_API_HOST="${VIRT_VALIDATE_URL#https://}"
+    TARGET_API_HOST="${TARGET_API_HOST%%/*}"
+    TARGET_API_HOST="${TARGET_API_HOST%%:*}"
+    case "$TARGET_API_HOST" in
+        api.*)
+            CLUSTER_DOMAIN="${TARGET_API_HOST#api.}"
+            ;;
+        *)
+            echo "ERROR: Cannot derive the target ingress domain from ${VIRT_VALIDATE_URL}; set target.toolDownloads.clusterDomain or explicit ocURL and virtctlURL." >&2
+            exit 1
+            ;;
+    esac
+fi
+if [ -z "$CLUSTER_DOMAIN" ] && { [ -z "$OC_URL" ] || { [ -z "$VIRTCTL_URL" ] && [ "${VIRT_VALIDATE_SKIP_VIRTCTL:-}" != "true" ]; }; } && [ -z "${VIRT_VALIDATE_URL:-}" ]; then
     # Get cluster domain from OAuth issuer (publicly accessible endpoint)
-    OAUTH_ISSUER=$(curl -ksS https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/.well-known/oauth-authorization-server \
+    OAUTH_ISSUER=$(curl --connect-timeout 30 --max-time "$TOOL_DOWNLOAD_TIMEOUT_SECONDS" --fail --silent --show-error --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/.well-known/oauth-authorization-server \
         | jq -r '.issuer // empty')
 
     if [ -z "$OAUTH_ISSUER" ]; then
@@ -42,53 +61,57 @@ if [ -z "$CLUSTER_DOMAIN" ]; then
     fi
 fi
 
-echo "Downloading cluster tools from: ${CLUSTER_DOMAIN}" >&2
+if [ -z "$OC_URL" ]; then
+    [ -n "$CLUSTER_DOMAIN" ] || { echo "ERROR: target.toolDownloads.ocURL or target.toolDownloads.clusterDomain is required." >&2; exit 1; }
+    OC_URL="https://downloads-openshift-console.apps.${CLUSTER_DOMAIN}/amd64/linux/oc.rhel9.tar"
+fi
 
-# Download and install oc
-curl -ksSL "https://downloads-openshift-console.apps.${CLUSTER_DOMAIN}/amd64/linux/oc.rhel9.tar" | tar -xf - -C /usr/local/bin/
+# Download and install oc.
+# TODO: Replace this dynamically discovered archive with a pinned, verified CLI
+# artifact in the controller image before this mode is promoted beyond a PoC.
+# Tracking issue: https://github.com/openshift-cnv/virt-cluster-validate/issues/35
+# TODO: Replace --insecure by trusting the target ingress CA, or remove this
+# runtime download by baking a pinned, verified CLI into the validator image.
+echo "Downloading oc from ${OC_URL}" >&2
+curl --connect-timeout 30 --max-time "$TOOL_DOWNLOAD_TIMEOUT_SECONDS" --insecure --fail --silent --show-error --location "$OC_URL" | tar -xf - -C /usr/local/bin/
 mv /usr/local/bin/oc.rhel9 /usr/local/bin/oc
 chmod +x /usr/local/bin/oc
 
-# Download and install virtctl
-echo "Looking for hyperconverged-cluster-cli-download route..." >&2
-ROUTE_JSON=$(oc get route --all-namespaces -o json 2>/dev/null || true)
-VIRTCTL_NS=$(echo "$ROUTE_JSON" | jq -r '.items[] | select(.metadata.name == "hyperconverged-cluster-cli-download") | .metadata.namespace' 2>/dev/null | head -1)
-VIRTCTL_HOST=$(echo "$ROUTE_JSON" | jq -r '.items[] | select(.metadata.name == "hyperconverged-cluster-cli-download") | .spec.host' 2>/dev/null | head -1)
-
-if [ -z "$VIRTCTL_NS" ] || [ -z "$VIRTCTL_HOST" ]; then
-    echo "ERROR: hyperconverged-cluster-cli-download route not found in any namespace" >&2
-    exit 1
-fi
-echo "Found route in namespace ${VIRTCTL_NS} (host: ${VIRTCTL_HOST})" >&2
-
-echo "Waiting for hyperconverged-cluster-cli-download endpoint to become ready..." >&2
-VIRTCTL_TIMEOUT=120
-VIRTCTL_ELAPSED=0
-VIRTCTL_READY=""
-while [ "$VIRTCTL_ELAPSED" -lt "$VIRTCTL_TIMEOUT" ]; do
-    VIRTCTL_READY=$(oc get endpoints hyperconverged-cluster-cli-download -n "$VIRTCTL_NS" \
-        -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
-    if [ -n "$VIRTCTL_READY" ]; then
-        echo "Endpoint ready after ${VIRTCTL_ELAPSED}s" >&2
-        break
+# Configure the downloaded client for the remote target. The validation runner
+# creates its own kubeconfig later, but this keeps standalone use of this
+# bootstrap script pointed at the target as well.
+if [ -n "${VIRT_VALIDATE_URL:-}" ] && [ -n "${VIRT_VALIDATE_TOKEN:-}" ]; then
+    TOOL_KUBECONFIG="${VIRT_VALIDATE_TOOL_KUBECONFIG:-/tmp/virt-validation/tools-kubeconfig}"
+    mkdir -p "$(dirname "$TOOL_KUBECONFIG")"
+    if [ "${VIRT_VALIDATE_INSECURE_SKIP_TLS:-}" = "true" ]; then
+        oc config --kubeconfig="$TOOL_KUBECONFIG" set-cluster target --server="$VIRT_VALIDATE_URL" --insecure-skip-tls-verify=true
+    else
+        if [ -z "${VIRT_VALIDATE_CA_FILE:-}" ]; then
+            echo "ERROR: VIRT_VALIDATE_CA_FILE is required for a TLS-verified target connection." >&2
+            exit 1
+        fi
+        oc config --kubeconfig="$TOOL_KUBECONFIG" set-cluster target --server="$VIRT_VALIDATE_URL" --certificate-authority="$VIRT_VALIDATE_CA_FILE" --embed-certs=true
     fi
-    echo "Endpoint not ready yet (${VIRTCTL_ELAPSED}/${VIRTCTL_TIMEOUT}s)..." >&2
-    sleep 5
-    VIRTCTL_ELAPSED=$((VIRTCTL_ELAPSED + 5))
-done
-
-if [ -z "$VIRTCTL_READY" ]; then
-    echo "ERROR: hyperconverged-cluster-cli-download endpoint not ready after ${VIRTCTL_TIMEOUT}s" >&2
-    echo "Endpoint status:" >&2
-    oc get endpoints hyperconverged-cluster-cli-download -n "$VIRTCTL_NS" -o yaml 2>&1 || true
-    echo "Pod status:" >&2
-    oc get pods -n "$VIRTCTL_NS" -l name=hyperconverged-cluster-cli-download -o wide 2>&1 || true
-    exit 1
+    oc config --kubeconfig="$TOOL_KUBECONFIG" set-credentials target-validator --token="$VIRT_VALIDATE_TOKEN"
+    oc config --kubeconfig="$TOOL_KUBECONFIG" set-context target-validator --cluster=target --user=target-validator
+    oc config --kubeconfig="$TOOL_KUBECONFIG" use-context target-validator
+    export KUBECONFIG="$TOOL_KUBECONFIG"
 fi
 
-VIRTCTL_URL="https://${VIRTCTL_HOST}/amd64/linux/virtctl.tar.gz"
+if [ "${VIRT_VALIDATE_SKIP_VIRTCTL:-}" = "true" ]; then
+    echo "Skipping virtctl download" >&2
+    exit 0
+fi
+
+# Download and install virtctl from the target's conventional generated Route
+# only when the request did not supply an explicit endpoint. Avoid discovering
+# routes through the target API: that would require cluster-wide Route access.
+if [ -z "$VIRTCTL_URL" ]; then
+    [ -n "$CLUSTER_DOMAIN" ] || { echo "ERROR: target.toolDownloads.virtctlURL or target.toolDownloads.clusterDomain is required." >&2; exit 1; }
+    VIRTCTL_URL="https://hyperconverged-cluster-cli-download-openshift-cnv.apps.${CLUSTER_DOMAIN}/amd64/linux/virtctl.tar.gz"
+fi
 echo "Downloading virtctl from ${VIRTCTL_URL}..." >&2
-if ! curl -ksSL --fail "$VIRTCTL_URL" | tar -xzf - -C /usr/local/bin/; then
+if ! curl --connect-timeout 30 --max-time "$TOOL_DOWNLOAD_TIMEOUT_SECONDS" --insecure --fail --silent --show-error --location "$VIRTCTL_URL" | tar -xzf - -C /usr/local/bin/; then
     echo "ERROR: Failed to download virtctl from ${VIRTCTL_URL}" >&2
     exit 1
 fi
