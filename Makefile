@@ -19,7 +19,11 @@ CONTROLLER_GEN := go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTR
 SETUP_ENVTEST ?= setup-envtest
 ENVTEST_KUBERNETES_VERSION ?= 1.37.x
 
-.PHONY: build-controller check-controller fmt-controller generate generate-check lint-controller test-controller test-envtest
+.PHONY: build-controller check-controller fmt-controller generate generate-check lint-controller test-controller test-envtest image-validator image-controller deploy-controller bootstrap-target run-controller-e2e
+
+CONTAINER_ENGINE ?= podman
+VALIDATOR_IMAGE ?= quay.io/openshift-cnv/virt-cluster-validate:dev
+CONTROLLER_IMAGE ?= quay.io/openshift-cnv/virt-validation-controller:dev
 
 generate:
 	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths=./api/...
@@ -34,6 +38,21 @@ generate-check:
 
 build-controller:
 	go build -o bin/validation-controller ./cmd/validation-controller
+
+image-validator:
+	$(CONTAINER_ENGINE) build -t $(VALIDATOR_IMAGE) -f Containerfile .
+
+image-controller:
+	$(CONTAINER_ENGINE) build -t $(CONTROLLER_IMAGE) -f build/validation-controller/Containerfile .
+
+deploy-controller:
+	CONTROLLER_IMAGE=$(CONTROLLER_IMAGE) VALIDATOR_IMAGE=$(VALIDATOR_IMAGE) ./hack/deploy-controller.sh
+
+bootstrap-target:
+	./hack/bootstrap-validation-target.sh
+
+run-controller-e2e:
+	./hack/run-controller-e2e.sh
 
 test-controller:
 	go test $(CONTROLLER_PACKAGES)
